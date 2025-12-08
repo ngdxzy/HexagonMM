@@ -211,6 +211,127 @@ bool test_mul_mat_f16_f32(ggml_backend_t backend) {
 }
 
 
+// Test matrix multiplication
+bool test_mul_mat_q8_f32(ggml_backend_t backend) {
+    GGML_LOG_INFO("\n=== Testing Matrix Multiplication F16 x F32 ===\n");
+    
+    // NOTE: Hexagon backend supports:
+    // - Q4_0, Q8_0, MXFP4 types for src0 (weights)
+    // - F16 for src0 (requires experimental flag)
+    // - F32 for src1 (input) and dst (output)
+    // F32 x F32 matmul is NOT supported, so we use F16 x F32
+    
+    const int m = 256;   // rows of result
+    const int n = 512;   // cols of result  
+    const int k = 256;  // shared dimension
+    
+    struct ggml_init_params params = {
+        .mem_size   = 256 * 1024 * 1024,
+        .mem_buffer = NULL,
+        .no_alloc   = true,  // Use backend buffers
+    };
+    struct ggml_context* ctx = ggml_init(params);
+    if (!ctx) {
+        GGML_LOG_ERROR("Failed to create ggml context\n");
+        return false;
+    }
+    
+    // Create input matrices
+    // For ggml_mul_mat(a, b): result[m,n] = a[k,m] @ b[n,k]
+    // a is transposed in the multiplication
+    // Use F16 for src0 (a) as Hexagon supports F16 x F32 but not F32 x F32
+    struct ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE, k, m);  // [k, m]
+    struct ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);  // [k, n]
+    
+    // Apply matrix multiplication
+    struct ggml_tensor* result = ggml_mul_mat(ctx, a, b);
+    
+    // Build graph
+    struct ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, result);
+    
+    // Allocate buffers on the backend
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        GGML_LOG_ERROR("Failed to allocate backend buffer\n");
+        ggml_free(ctx);
+        return false;
+    }
+    
+    // Initialize with test data
+    ggml_fp16_t* a_data = (ggml_fp16_t*)a->data;
+    float* b_data = (float*)b->data;
+    for (int i = 0; i < k * m; i++) {
+        a_data[i] = ggml_fp32_to_fp16(2 * ((float)rand()/RAND_MAX - 0.5f));  // values between -1.0 and 1.0
+    }
+    for (int i = 0; i < k * n; i++) {
+        b_data[i] = (float)(2 * ((float)rand()/RAND_MAX - 0.5));
+    }
+    
+    GGML_LOG_INFO("Matrix A shape: [%d, %d]\n", (int)a->ne[1], (int)a->ne[0]);
+    GGML_LOG_INFO("Matrix B shape: [%d, %d]\n", (int)b->ne[1], (int)b->ne[0]);
+    
+    GGML_LOG_INFO("Computing matrix multiplication on Hexagon backend...\n");
+    
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("Failed to compute graph\n");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        return false;
+    }
+    
+    GGML_LOG_INFO("Result shape: [%d, %d]\n", (int)result->ne[1], (int)result->ne[0]);
+    print_tensor("Result (first 10)", result);
+    
+    // CPU reference implementation
+    GGML_LOG_INFO("\nComputing CPU reference...\n");
+    float* cpu_reference = (float*)malloc(m * n * sizeof(float));
+    ggml_fp16_t* a_data_cpu = (ggml_fp16_t*)a->data;
+    float* b_data_cpu = (float*)b->data;
+    
+    // Matrix multiplication: C[n, m] = B @ A^T; (n x k) @ (k x m) = (n x m), or X @ W^T, all row major
+    // If everything is viewed as column-major:
+    // C^T = A @ B^T; (m x k) @ (k x n) = (m x n)
+    // For each output element C[i,j], compute dot product of A[:,i] with B[:,j]
+    // A is accessed with [i * k + p], which means A is m x k in row-major
+    // B is accessed with [j * k + p], which means B is n x k in row-major
+    // C is stored as [j * m + i], which means C is n * m in row-major
+    // k is D, m is DQ, n is L
+    // So: A: [DQ, D], B: [L, D], C: [L, DQ]
+    // During DSP operation, A is put as src0, therefore, it is viewed as [k, m] in column-major
+    //                       B is put as src1, therefore, it is viewed as [k, n] in column-major
+    // Result is in dst, viewed as [m, n] in column-major
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int p = 0; p < k; p++) {
+                // A is stored column-major: A[k,m] means k rows, m columns
+                // Element at row p, column i is at index: i*k + p
+                ggml_fp16_t a_val_fp16 = a_data_cpu[i * k + p];
+                float a_val = ggml_fp16_to_fp32(a_val_fp16);
+                float b_val = b_data_cpu[j * k + p];
+                sum += a_val * b_val;
+            }
+            // Result is stored column-major: result[m,n]
+            // Element at row i, column j is at index: j*m + i
+            cpu_reference[j * m + i] = sum;
+        }
+    }
+    
+    // Calculate error metrics
+    float* result_data = (float*)result->data;
+    ErrorMetrics metrics = calculate_error_metrics(cpu_reference, result_data, m * n);
+    print_error_metrics(metrics);
+    
+    // Verify result: with all 1.0 inputs, result should be k (1024) in each element
+    
+    free(cpu_reference);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    GGML_LOG_INFO("Matrix multiplication test completed successfully!\n");
+    return true;
+}
+
 int main(int argc, char** argv) {
     GGML_LOG_INFO("========================================\n");
     GGML_LOG_INFO("GGML Hexagon Backend Test Suite\n");
