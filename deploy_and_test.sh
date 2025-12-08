@@ -31,24 +31,24 @@ adb devices
 # Clean up old installation
 echo ""
 echo "Cleaning up old installation..."
-adb shell "rm -rf $DEVICE_DIR" 2>/dev/null || true
+adb -s RFCY919LGLD shell "rm -rf $DEVICE_DIR" 2>/dev/null || true
 
 # Create directory on device
 echo "Creating directory on device..."
-adb shell "mkdir -p $DEVICE_DIR/lib"
+adb -s RFCY919LGLD shell "mkdir -p $DEVICE_DIR/lib"
 
 # Push test executable
 echo ""
 echo "Pushing test executable..."
-adb push $PKG_DIR/bin/hexagon_test $DEVICE_DIR/
+adb -s RFCY919LGLD push $PKG_DIR/bin/hexagon_test $DEVICE_DIR/
 
 # Push libraries
 echo ""
 echo "Pushing libraries..."
-adb push $PKG_DIR/lib/ $DEVICE_DIR/
+adb -s RFCY919LGLD push $PKG_DIR/lib/ $DEVICE_DIR/
 
 # Make executable
-adb shell "chmod +x $DEVICE_DIR/hexagon_test"
+adb -s RFCY919LGLD shell "chmod +x $DEVICE_DIR/hexagon_test"
 
 # Enable FARF logging for DSP
 # 0x1f enables all FARF levels (ERROR, HIGH, MEDIUM, LOW, ALWAYS)
@@ -58,12 +58,12 @@ for HTP_LIB in $(ls $PKG_DIR/lib/libggml-htp-v*.so 2>/dev/null); do
     HTP_LIB_NAME=$(basename "$HTP_LIB")
     FARF_FILE="${HTP_LIB_NAME%.so}.farf"
     echo "  Creating $FARF_FILE"
-    adb shell "echo 0x1f > $DEVICE_DIR/lib/$FARF_FILE"
+    adb -s RFCY919LGLD shell "echo 0x1f > $DEVICE_DIR/lib/$FARF_FILE"
 done
 
 # Also create hexagon_test.farf (FARF looks for executable name)
 echo "  Creating hexagon_test.farf (for executable-based logging)"
-adb shell "echo 0x1f > $DEVICE_DIR/lib/hexagon_test.farf"
+adb -s RFCY919LGLD shell "echo 0x1f > $DEVICE_DIR/lib/hexagon_test.farf"
 
 echo ""
 echo "========================================="
@@ -88,16 +88,16 @@ echo "  PROF=$PROF (profile mode)"
 echo ""
 
 # Clear logcat
-adb logcat -c
+adb -s RFCY919LGLD logcat -c
 
 # Start logcat in background to capture DSP FARF logs
-adb logcat -v threadtime > /tmp/hexagon_logcat.txt &
+adb -s RFCY919LGLD logcat -v threadtime > /tmp/hexagon_logcat.txt &
 LOGCAT_PID=$!
 sleep 1
 
 echo "Running test..."
 set +e # Allow test to fail without exiting script
-adb shell "cd $DEVICE_DIR && \
+adb -s RFCY919LGLD shell "cd $DEVICE_DIR && \
     export LD_LIBRARY_PATH=$DEVICE_DIR/lib:\$LD_LIBRARY_PATH && \
     export ADSP_LIBRARY_PATH=$DEVICE_DIR/lib && \
     export GGML_HEXAGON_NDEV=$NDEV && \
