@@ -3,91 +3,213 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <iostream>
+#include <fstream>
 
-#include "loadTensor.hpp"
-#include "helperFunction.hpp"
-#include "errorMetrics.hpp"
-#include "ggml-impl.h"
-#include "ggml.h"
-#include "ggml-backend.h"
-#include "ggml-hexagon.h"
+#include "utils/loadTensor.hpp"
+#include "utils/helperFunction.hpp"
+#include "utils/errorMetrics.hpp"
+#include "test_utils.hpp"
 
-#define GGML_LOG_INFO(...) fprintf(stderr, __VA_ARGS__)
-#define GGML_LOG_ERROR(...) fprintf(stderr, "ERROR: " __VA_ARGS__)
+bool test_mul_mat_q8_0_f32(ggml_backend_t& backend, std::string gguf_file);
+bool test_mul_mat_f16_f32(ggml_backend_t& backend);
 
-// Helper function to print tensor values
-void print_tensor(const char* name, struct ggml_tensor* tensor, int max_elements = 10) {
-    GGML_LOG_INFO("%s: [", name);
-    float* data = (float*)tensor->data;
-    int n_elements = ggml_nelements(tensor);
-    int print_count = n_elements < max_elements ? n_elements : max_elements;
+int main(int argc, char** argv) {
     
-    for (int i = 0; i < print_count; i++) {
-        GGML_LOG_INFO("%.4f", data[i]);
-        if (i < print_count - 1) GGML_LOG_INFO(", ");
+    bool all_passed = true;
+    
+    ggml_backend_t backend;
+    if (!initialize_backend(backend)) {
+        GGML_LOG_ERROR("Failed to initialize backend\n");
+        return 1;
     }
-    if (n_elements > max_elements) {
-        GGML_LOG_INFO(" ... (%d more)", n_elements - max_elements);
+
+
+    if (!test_mul_mat_f16_f32(backend)) {
+        GGML_LOG_ERROR("Failed to test mul mat f16 f32\n");
+        all_passed = false;
     }
-    GGML_LOG_INFO("]\n");
+
+    if (argc > 1 && !test_mul_mat_q8_0_f32(backend, argv[1])) {
+        GGML_LOG_ERROR("Failed to test mul mat q8_0 f32\n");
+        all_passed = false;
+    }
+
+
+    // Cleanup
+    ggml_backend_free(backend);
+    
+    GGML_LOG_INFO("\n========================================\n");
+    if (all_passed) {
+        GGML_LOG_INFO("All tests PASSED! ✓\n");
+    } else {
+        GGML_LOG_INFO("Some tests FAILED! ✗\n");
+    }
+    GGML_LOG_INFO("========================================\n");
+    
+    return 0;
 }
 
 
-ErrorMetrics calculate_error_metrics(const float* reference, const float* computed, int n_elements) {
-    ErrorMetrics metrics = {0.0f, 0.0f, 0.0f, 0.0f};
+bool test_mul_mat_q8_0_f32(ggml_backend_t& backend, std::string gguf_file) {
+    const int L = 256;
+    const int DV = 512;
+    const int D = 2048;
+    GGML_LOG_INFO("\n=== Testing Matrix Multiplication Q8_0 x F32 ===\n");
+    GGUFTensorManager* tensor_manager = new GGUFTensorManager(gguf_file, backend);
+    struct ggml_tensor* weight = tensor_manager->get_tensor("blk.0.attn_v.weight");
+    if (!weight) {
+        GGML_LOG_ERROR("Failed to load blk.0.attn_v.weight\n");
+    } else {
+        GGML_LOG_INFO("blk.0.attn_v.weight loaded successfully\n");
+    }
+
+    GGML_LOG_INFO("Loaded weight tensor with shape: [%d, %d]\n", (int)weight->ne[1], (int)weight->ne[0]);
+    struct ggml_init_params ctx_params = {
+        .mem_size = ggml_nbytes(weight) + L * DV * sizeof(float) + D * L * sizeof(float),
+        .mem_buffer = nullptr,
+        .no_alloc = true
+    };
+    struct ggml_context* local_ctx = ggml_init(ctx_params);
     
-    double l1_error = 0.0;
-    double l2_error = 0.0;
-    double l1_norm_ref = 0.0;
-    double l2_norm_ref = 0.0;
-    double dot_product = 0.0;
-    double norm_ref = 0.0;
-    double norm_computed = 0.0;
-    double squared_error = 0.0;
+    // create x
+    struct ggml_tensor* x = ggml_new_tensor_2d(local_ctx, GGML_TYPE_F32, D, L);
+    if (!x) {
+        GGML_LOG_ERROR("Failed to create x tensor\n");
+        return false;
+    }
+
+    // create w
+    struct ggml_tensor* w = ggml_new_tensor_2d(local_ctx, weight->type, weight->ne[0], weight->ne[1]);
+    if (!w) {
+        GGML_LOG_ERROR("Failed to create w tensor\n");
+        return false;
+    }
+
+    // pass though mm for graph building
+    struct ggml_tensor* y = ggml_mul_mat(local_ctx, w, x);
+    if (!y) {
+        GGML_LOG_ERROR("Failed to create result tensor\n");
+        return false;
+    }
+
+    // Build graph
+    struct ggml_cgraph* gf = ggml_new_graph(local_ctx);
+    ggml_build_forward_expand(gf, y);
     
-    for (int i = 0; i < n_elements; i++) {
-        double diff = fabs(computed[i] - reference[i]);
-        double ref_abs = fabs(reference[i]);
-        
-        l1_error += diff;
-        l2_error += diff * diff;
-        l1_norm_ref += ref_abs;
-        l2_norm_ref += reference[i] * reference[i];
-        
-        dot_product += reference[i] * computed[i];
-        norm_ref += reference[i] * reference[i];
-        norm_computed += computed[i] * computed[i];
-        
-        squared_error += diff * diff;
+    // Allocate buffers on the backend
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(local_ctx, backend);
+    if (!buffer) {
+        GGML_LOG_ERROR("Failed to allocate backend buffer\n");
+        ggml_free(local_ctx);
+        return false;
     }
     
-    // L1 relative error
-    metrics.l1_relative_error = (l1_norm_ref > 1e-10) ? (l1_error / l1_norm_ref) : 0.0f;
-    
-    // L2 relative error
-    metrics.l2_relative_error = (l2_norm_ref > 1e-10) ? sqrt(l2_error / l2_norm_ref) : 0.0f;
-    
-    // Cosine similarity
-    double denom = sqrt(norm_ref) * sqrt(norm_computed);
-    metrics.cosine_similarity = (denom > 1e-10) ? (dot_product / denom) : 0.0f;
-    
-    // RMS error
-    metrics.rms_error = sqrt(squared_error / n_elements);
-    
-    return metrics;
-}
+    // copy data
+    memcpy(w->data, weight->data, ggml_nbytes(weight));
 
-void print_error_metrics(const ErrorMetrics& metrics) {
-    GGML_LOG_INFO("\n--- Error Metrics ---\n");
-    GGML_LOG_INFO("L1 Relative Error:    %.6e\n", metrics.l1_relative_error);
-    GGML_LOG_INFO("L2 Relative Error:    %.6e\n", metrics.l2_relative_error);
-    GGML_LOG_INFO("Cosine Similarity:    %.8f\n", metrics.cosine_similarity);
-    GGML_LOG_INFO("RMS Error:            %.6e\n", metrics.rms_error);
-    GGML_LOG_INFO("--------------------\n");
+    // release the tensor manager
+    delete tensor_manager;
+
+    GGML_LOG_INFO("Created y tensor with shape: [%d, %d]\n", (int)y->ne[1], (int)y->ne[0]);
+    GGML_LOG_INFO("Created w tensor with shape: [%d, %d]\n", (int)w->ne[1], (int)w->ne[0]);
+    GGML_LOG_INFO("Created x tensor with shape: [%d, %d]\n", (int)x->ne[1], (int)x->ne[0]);
+
+    // load x
+    std::ifstream x_file("../gguf/layer_0_x.bin", std::ios::binary);
+    if (!x_file.is_open()) {
+        GGML_LOG_ERROR("Failed to open x file\n");
+        ggml_free(local_ctx);
+        ggml_backend_buffer_free(buffer);
+        return false;
+    }
+    x_file.read((char*)x->data, D * L * sizeof(float));
+    x_file.close();
+
+    std::cout << "x: " << std::endl;
+    print_matrix((float*)x->data, x->ne[1], x->ne[0], 10, 10);
+
+    // load y reference
+    float* y_ref_fp32 = (float*)malloc(DV * L * sizeof(float));
+    std::ifstream y_file("../gguf/layer_0_v.bin", std::ios::binary);
+    if (!y_file.is_open()) {
+        GGML_LOG_ERROR("Failed to open y file\n");
+        ggml_free(local_ctx);
+        ggml_backend_buffer_free(buffer);
+        return false;
+    }
+    y_file.read((char*)y_ref_fp32, DV * L * sizeof(float));
+    y_file.close();
+
+    std::cout << "y reference: " << std::endl;
+    print_matrix(y_ref_fp32, L, DV, 10, 10);
+
+    
+    // test if the weight is loaded correctly
+    {
+        // dequant the weight to FP32 array
+        float* weight_data_fp32 = (float*)malloc(w->ne[0] * w->ne[1] * sizeof(float));
+        for (int row = 0; row < w->ne[1]; row++) {
+            signed char* q = (signed char*)((uint8_t*)w->data + row * w->nb[1]);
+            ggml_fp16_t* scale = (ggml_fp16_t*)(q + w->ne[0]);
+            for (int col = 0; col < weight->ne[0] / 32; col++) {
+                float scale_value = ggml_fp16_to_fp32(scale[col]);
+                for (int i = 0; i < 32; i++) {
+                    weight_data_fp32[row * w->ne[0] + col * 32 + i] = q[col * 32 + i] * scale_value;
+                }
+            }
+        }
+
+        std::cout << "Dequantized weight tensor:\n";
+        print_matrix(weight_data_fp32, w->ne[1], w->ne[0], 10, 10);
+        std::ifstream reference_weight("../gguf/v_proj_weights.bin", std::ios::binary);
+        if (!reference_weight.is_open()) {
+            GGML_LOG_ERROR("Failed to open reference weight file\n");
+            ggml_free(local_ctx);
+            ggml_backend_buffer_free(buffer);
+            return false;
+        }
+        float* reference_weight_data_fp32 = (float*)malloc(w->ne[0] * w->ne[1] * sizeof(float));
+        reference_weight.read((char*)reference_weight_data_fp32, w->ne[0] * w->ne[1] * sizeof(float));
+        reference_weight.close();
+        std::cout << "Reference weight tensor:\n";
+        print_matrix(reference_weight_data_fp32, w->ne[1], w->ne[0], 10, 10);
+
+        ErrorMetrics metrics = calculate_error_metrics(weight_data_fp32, reference_weight_data_fp32, w->ne[0] * w->ne[1]);
+        print_error_metrics(metrics);
+        if (metrics.cosine_similarity < 0.99) {
+            GGML_LOG_ERROR("Cosine similarity is less than 0.99\n");
+            ggml_free(local_ctx);
+            ggml_backend_buffer_free(buffer);
+            return false;
+        }
+        free(reference_weight_data_fp32);
+        free(weight_data_fp32);
+    }
+    // launch the graph
+    std::cout << "Launching graph..." << std::endl;
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("Failed to compute graph\n");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(local_ctx);
+        return false;
+    }
+    std::cout << "Graph launched successfully" << std::endl;
+    // get the result
+    float* y_data = (float*)y->data;
+    std::cout << "y: " << std::endl;
+    print_matrix(y_data, y->ne[1], y->ne[0], 10, 10);
+    // calculate the error metrics
+    ErrorMetrics metrics = calculate_error_metrics(y_ref_fp32, y_data, y->ne[0] * y->ne[1]);
+    print_error_metrics(metrics);
+    
+    ggml_free(local_ctx);
+    ggml_backend_buffer_free(buffer);
+    return true;
 }
 // Test matrix multiplication
 // Test matrix multiplication
-bool test_mul_mat_f16_f32(ggml_backend_t backend) {
+bool test_mul_mat_f16_f32(ggml_backend_t& backend) {
     GGML_LOG_INFO("\n=== Testing Matrix Multiplication F16 x F32 ===\n");
     
     // NOTE: Hexagon backend supports:
@@ -98,7 +220,7 @@ bool test_mul_mat_f16_f32(ggml_backend_t backend) {
     
     const int m = 256;   // rows of result
     const int n = 512;   // cols of result  
-    const int k = 256;  // shared dimension
+    const int k = 1024;  // shared dimension
     
     struct ggml_init_params params = {
         .mem_size   = 256 * 1024 * 1024,
@@ -136,6 +258,7 @@ bool test_mul_mat_f16_f32(ggml_backend_t backend) {
     // Initialize with test data
     ggml_fp16_t* a_data = (ggml_fp16_t*)a->data;
     float* b_data = (float*)b->data;
+    srand(123); 
     for (int i = 0; i < k * m; i++) {
         a_data[i] = ggml_fp32_to_fp16(random_float(-4, 4));  // values between -1.0 and 1.0
     }
@@ -205,201 +328,4 @@ bool test_mul_mat_f16_f32(ggml_backend_t backend) {
     ggml_free(ctx);
     GGML_LOG_INFO("Matrix multiplication test completed successfully!\n");
     return true;
-}
-
-
-// Test matrix multiplication
-bool test_mul_mat_q8_f32(ggml_backend_t backend) {
-    
-    return true;
-
-}
-
-
-
-// void test_load_ggml_file(const std::string &filename) {
-//     GGML_LOG_INFO("\n=== Loading GGUF File: %s ===\n", filename.c_str());
-
-//     struct gguf_context * gguf_metadata_ctx = nullptr; 
-//     struct ggml_context * ctx_gguf = nullptr; 
-
-//     // Step 1: Load GGUF metadata without allocating tensor data
-//     struct gguf_init_params params = {
-//         .no_alloc = true,
-//         .ctx = &ctx_gguf
-//     };
-//     gguf_metadata_ctx = gguf_init_from_file(filename.c_str(), params);
-    
-//     if (!gguf_metadata_ctx) {
-//         GGML_LOG_ERROR("Failed to load GGUF file: %s\n", filename.c_str());
-//         return;
-//     }
-    
-//     GGML_LOG_INFO("GGUF file loaded successfully!\n");
-    
-//     // Step 2: Print general metadata
-//     int n_kv = gguf_get_n_kv(gguf_metadata_ctx);
-//     GGML_LOG_INFO("Number of key-value pairs: %d\n", n_kv);
-    
-//     // Print some key metadata (architecture, parameter count, etc.)
-//     for (int i = 0; i < n_kv; i++) {
-//         const char* key = gguf_get_key(gguf_metadata_ctx, i);
-//         enum gguf_type type = gguf_get_kv_type(gguf_metadata_ctx, i);
-        
-//         // Print important metadata
-//         if (type == GGUF_TYPE_STRING) {
-//             const char* value = gguf_get_val_str(gguf_metadata_ctx, i);
-//             GGML_LOG_INFO("  %s: %s\n", key, value);
-//         } else if (type == GGUF_TYPE_UINT32) {
-//             uint32_t value = gguf_get_val_u32(gguf_metadata_ctx, i);
-//             GGML_LOG_INFO("  %s: %u\n", key, value);
-//         } else if (type == GGUF_TYPE_FLOAT32) {
-//             float value = gguf_get_val_f32(gguf_metadata_ctx, i);
-//             GGML_LOG_INFO("  %s: %f\n", key, value);
-//         }
-//     }
-    
-//     // Step 3: Get tensor information
-//     int n_tensors = gguf_get_n_tensors(gguf_metadata_ctx);
-//     GGML_LOG_INFO("\nNumber of tensors: %d\n", n_tensors);
-    
-//     // Print tensor details
-//     for (int i = 0; i < n_tensors; i++) {
-//         const char* tensor_name = gguf_get_tensor_name(gguf_metadata_ctx, i);
-//         struct ggml_tensor* tensor = ggml_get_tensor(ctx_gguf, tensor_name);
-        
-//         if (tensor) {
-//             GGML_LOG_INFO("\nTensor %d: %s\n", i, tensor_name);
-//             GGML_LOG_INFO("  Type: %s\n", ggml_type_name(tensor->type));
-//             GGML_LOG_INFO("  Dimensions: [%lld", tensor->ne[0]);
-//             for (int d = 1; d < GGML_MAX_DIMS && tensor->ne[d] > 1; d++) {
-//                 GGML_LOG_INFO(", %lld", tensor->ne[d]);
-//             }
-//             GGML_LOG_INFO("]\n");
-            
-//             // Calculate total elements
-//             size_t n_elements = 1;
-//             for (int d = 0; d < GGML_MAX_DIMS; d++) {
-//                 if (tensor->ne[d] > 1) n_elements *= tensor->ne[d];
-//                 else break;
-//             }
-//             GGML_LOG_INFO("  Total elements: %zu\n", n_elements);
-//             GGML_LOG_INFO("  Size: %zu bytes\n", ggml_nbytes(tensor));
-//         }
-//     }
-    
-//     // Step 4: To actually load tensor data, you need to allocate buffers
-//     // Option A: Allocate on backend (Hexagon)
-//     // ggml_backend_t backend = ...; // your backend
-//     // ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx_gguf, backend);
-    
-//     // Option B: Allocate on CPU
-//     // You would need to re-initialize with no_alloc = false or manually allocate
-    
-//     // For now, we're just inspecting metadata
-//     GGML_LOG_INFO("\n=== GGUF File Inspection Complete ===\n");
-    
-//     // Cleanup
-//     gguf_free(gguf_metadata_ctx);
-//     ggml_free(ctx_gguf);
-// }
-
-
-
-
-int main(int argc, char** argv) {
-    GGML_LOG_INFO("========================================\n");
-    GGML_LOG_INFO("GGML Hexagon Backend Test Suite\n");
-    GGML_LOG_INFO("========================================\n\n");
-    
-    // Initialize Hexagon backend using the registry API
-    GGML_LOG_INFO("Initializing Hexagon backend...\n");
-    
-    ggml_backend_reg_t reg = ggml_backend_hexagon_reg();
-    if (!reg) {
-        GGML_LOG_ERROR("Failed to get Hexagon backend registry\n");
-        return 1;
-    }
-    
-    // Get device count
-    size_t device_count = ggml_backend_reg_dev_count(reg);
-    GGML_LOG_INFO("Found %zu Hexagon device(s)\n", device_count);
-    
-    if (device_count == 0) {
-        GGML_LOG_ERROR("No Hexagon devices found\n");
-        return 1;
-    }
-    
-    // Get the first device
-    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
-    if (!dev) {
-        GGML_LOG_ERROR("Failed to get Hexagon device\n");
-        return 1;
-    }
-    
-    // Initialize backend from device
-    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
-    if (!backend) {
-        GGML_LOG_ERROR("Failed to initialize Hexagon backend from device\n");
-        return 1;
-    }
-    
-    if (!ggml_backend_is_hexagon(backend)) {
-        GGML_LOG_ERROR("Backend is not a Hexagon backend\n");
-        ggml_backend_free(backend);
-        return 1;
-    }
-    
-    GGML_LOG_INFO("Hexagon backend initialized successfully!\n");
-    GGML_LOG_INFO("Backend name: %s\n", ggml_backend_name(backend));
-    
-    // Run tests
-    bool all_passed = true;
-    
-    // Test 1: Matrix Multiplication (F16 x F32)
-    if (!test_mul_mat_f16_f32(backend)) {
-        GGML_LOG_ERROR("F16 x F32 matrix multiplication test FAILED\n");
-        all_passed = false;
-    }
-    
-    // Test 4: Load GGUF file (if provided as argument)
-    if (argc > 1) {
-        struct gguf_context * gguf_ctx = nullptr; 
-        struct ggml_context * ctx_gguf = nullptr;
-        ggml_backend_buffer_t buffer = nullptr;
-        std::unordered_map<std::string, struct ggml_tensor*> tensor_map;
-        bool loaded = load_gguf_with_data(argv[1], backend,  
-            gguf_ctx,
-            ctx_gguf,
-            buffer,
-            tensor_map);
-        if (!loaded) {
-            GGML_LOG_ERROR("Failed to load GGUF file: %s\n", argv[1]);
-            all_passed = false;
-        } else {
-            GGML_LOG_INFO("GGUF file loaded successfully: %s\n", argv[1]);
-        }
-        // // print all tensor names loaded
-        // GGML_LOG_INFO("\n=== Loaded Tensors ===\n");
-        // for (const auto& pair : tensor_map) {
-        //     GGML_LOG_INFO("Tensor Name: %s\n", pair.first.c_str());     
-        // }
-        // release the gguf context and ggml context and buffer   
-        ggml_backend_buffer_free(buffer);
-        gguf_free(gguf_ctx);
-        ggml_free(ctx_gguf);
-    }
-    
-    // Cleanup
-    ggml_backend_free(backend);
-    
-    GGML_LOG_INFO("\n========================================\n");
-    if (all_passed) {
-        GGML_LOG_INFO("All tests PASSED! ✓\n");
-    } else {
-        GGML_LOG_INFO("Some tests FAILED! ✗\n");
-    }
-    GGML_LOG_INFO("========================================\n");
-    
-    return 0;
 }

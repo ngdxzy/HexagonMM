@@ -15,11 +15,6 @@ struct ErrorMetrics {
 };
 
 
-
-
-
-
-
 ErrorMetrics calculate_error_metrics(const float* reference, const float* computed, int n_elements) ;
 
 void print_error_metrics(const ErrorMetrics& metrics);

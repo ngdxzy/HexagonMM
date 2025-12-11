@@ -43,6 +43,7 @@ target_link_libraries(hexagon_utils PUBLIC
 # Add executable
 add_executable(hexagon_test
     test_hexagon.cpp
+    test_utils.cpp
 )
 
 # Include directories
