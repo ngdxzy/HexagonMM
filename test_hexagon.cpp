@@ -53,33 +53,38 @@ int main(int argc, char** argv) {
 
 bool test_mul_mat_q8_0_f32(ggml_backend_t& backend, std::string gguf_file) {
     const int L = 256;
-    const int DV = 512;
-    const int D = 2048;
+    const int Do = 1024;
+    const int Di = 3072;
     GGML_LOG_INFO("\n=== Testing Matrix Multiplication Q8_0 x F32 ===\n");
     GGUFTensorManager* tensor_manager = new GGUFTensorManager(gguf_file, backend);
-    struct ggml_tensor* weight = tensor_manager->get_tensor("blk.0.attn_v.weight");
+    struct ggml_tensor* weight = tensor_manager->get_tensor("blk.0.ffn_down.weight");
     if (!weight) {
-        GGML_LOG_ERROR("Failed to load blk.0.attn_v.weight\n");
+        GGML_LOG_ERROR("Failed to load blk.2.ffn_down.weight\n");
     } else {
-        GGML_LOG_INFO("blk.0.attn_v.weight loaded successfully\n");
+        GGML_LOG_INFO("blk.2.ffn_down.weight loaded successfully\n");
     }
 
     GGML_LOG_INFO("Loaded weight tensor with shape: [%d, %d]\n", (int)weight->ne[1], (int)weight->ne[0]);
     struct ggml_init_params ctx_params = {
-        .mem_size = ggml_nbytes(weight) + L * DV * sizeof(float) + D * L * sizeof(float),
+        .mem_size = ggml_nbytes(weight) + L * Do * sizeof(float) + Di * L * sizeof(float),
         .mem_buffer = nullptr,
         .no_alloc = true
     };
     struct ggml_context* local_ctx = ggml_init(ctx_params);
     
     // create x
-    struct ggml_tensor* x = ggml_new_tensor_2d(local_ctx, GGML_TYPE_F32, D, L);
+    struct ggml_tensor* x = ggml_new_tensor_2d(local_ctx, GGML_TYPE_F32, Di, L);
     if (!x) {
         GGML_LOG_ERROR("Failed to create x tensor\n");
         return false;
     }
 
     // create w
+    std::cout << "Creating w tensor with shape: [" << weight->ne[0] << ", " << weight->ne[1] << "]" << std::endl;
+    std::cout << "Weight type: " << weight->type << std::endl;
+    std::cout << "Weight data: " << weight->data << std::endl;
+    std::cout << "Weight ne: " << weight->ne[0] << ", " << weight->ne[1] << std::endl;
+    std::cout << "Weight nb: " << weight->nb[1] << ", " << weight->nb[1] << std::endl;
     struct ggml_tensor* w = ggml_new_tensor_2d(local_ctx, weight->type, weight->ne[0], weight->ne[1]);
     if (!w) {
         GGML_LOG_ERROR("Failed to create w tensor\n");
@@ -116,43 +121,45 @@ bool test_mul_mat_q8_0_f32(ggml_backend_t& backend, std::string gguf_file) {
     GGML_LOG_INFO("Created x tensor with shape: [%d, %d]\n", (int)x->ne[1], (int)x->ne[0]);
 
     // load x
-    std::ifstream x_file("../gguf/layer_0_x.bin", std::ios::binary);
+    std::ifstream x_file("../gguf/x.bin", std::ios::binary);
     if (!x_file.is_open()) {
         GGML_LOG_ERROR("Failed to open x file\n");
         ggml_free(local_ctx);
         ggml_backend_buffer_free(buffer);
         return false;
     }
-    x_file.read((char*)x->data, D * L * sizeof(float));
+    x_file.read((char*)x->data, Di * L * sizeof(float));
     x_file.close();
 
     std::cout << "x: " << std::endl;
     print_matrix((float*)x->data, x->ne[1], x->ne[0], 10, 10);
 
     // load y reference
-    float* y_ref_fp32 = (float*)malloc(DV * L * sizeof(float));
-    std::ifstream y_file("../gguf/layer_0_v.bin", std::ios::binary);
+    float* y_ref_fp32 = (float*)malloc(Do * L * sizeof(float));
+    std::ifstream y_file("../gguf/y.bin", std::ios::binary);
     if (!y_file.is_open()) {
         GGML_LOG_ERROR("Failed to open y file\n");
         ggml_free(local_ctx);
         ggml_backend_buffer_free(buffer);
         return false;
     }
-    y_file.read((char*)y_ref_fp32, DV * L * sizeof(float));
+    y_file.read((char*)y_ref_fp32, Do * L * sizeof(float));
     y_file.close();
 
     std::cout << "y reference: " << std::endl;
-    print_matrix(y_ref_fp32, L, DV, 10, 10);
+    print_matrix(y_ref_fp32, L, Do, 10, 10);
 
     
     // test if the weight is loaded correctly
     {
         // dequant the weight to FP32 array
         float* weight_data_fp32 = (float*)malloc(w->ne[0] * w->ne[1] * sizeof(float));
+        std::cout << "Weight data: " << w->data << std::endl;
+        std::cout << "Weight shape: " << w->ne[0] << ", " << w->ne[1] << std::endl;
         for (int row = 0; row < w->ne[1]; row++) {
             signed char* q = (signed char*)((uint8_t*)w->data + row * w->nb[1]);
             ggml_fp16_t* scale = (ggml_fp16_t*)(q + w->ne[0]);
-            for (int col = 0; col < weight->ne[0] / 32; col++) {
+            for (int col = 0; col < w->ne[0] / 32; col++) {
                 float scale_value = ggml_fp16_to_fp32(scale[col]);
                 for (int i = 0; i < 32; i++) {
                     weight_data_fp32[row * w->ne[0] + col * 32 + i] = q[col * 32 + i] * scale_value;
@@ -162,7 +169,7 @@ bool test_mul_mat_q8_0_f32(ggml_backend_t& backend, std::string gguf_file) {
 
         std::cout << "Dequantized weight tensor:\n";
         print_matrix(weight_data_fp32, w->ne[1], w->ne[0], 10, 10);
-        std::ifstream reference_weight("../gguf/v_proj_weights.bin", std::ios::binary);
+        std::ifstream reference_weight("../gguf/w.bin", std::ios::binary);
         if (!reference_weight.is_open()) {
             GGML_LOG_ERROR("Failed to open reference weight file\n");
             ggml_free(local_ctx);
@@ -202,7 +209,7 @@ bool test_mul_mat_q8_0_f32(ggml_backend_t& backend, std::string gguf_file) {
     // calculate the error metrics
     ErrorMetrics metrics = calculate_error_metrics(y_ref_fp32, y_data, y->ne[0] * y->ne[1]);
     print_error_metrics(metrics);
-    
+
     ggml_free(local_ctx);
     ggml_backend_buffer_free(buffer);
     return true;
@@ -294,8 +301,8 @@ bool test_mul_mat_f16_f32(ggml_backend_t& backend) {
     // A is accessed with [i * k + p], which means A is m x k in row-major
     // B is accessed with [j * k + p], which means B is n x k in row-major
     // C is stored as [j * m + i], which means C is n * m in row-major
-    // k is D, m is DQ, n is L
-    // So: A: [DQ, D], B: [L, D], C: [L, DQ]
+    // k is D, m is Do, n is L
+    // So: A: [Do, D], B: [L, D], C: [L, Do]
     // During DSP operation, A is put as src0, therefore, it is viewed as [k, m] in column-major
     //                       B is put as src1, therefore, it is viewed as [k, n] in column-major
     // Result is in dst, viewed as [m, n] in column-major

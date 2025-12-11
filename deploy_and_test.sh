@@ -103,7 +103,7 @@ adb -s RFCY919LGLD shell "cd $DEVICE_DIR && \
     export GGML_HEXAGON_NDEV=$NDEV && \
     export GGML_HEXAGON_VERBOSE=$V && \
     export GGML_HEXAGON_PROFILE=$PROF && \
-    ./hexagon_test ../gguf/Llama-3.2-1B-Instruct-Q8_0.gguf"
+    ./hexagon_test ../gguf/Qwen3-0.6B-Q8_0.gguf"
 EXIT_CODE=$?
 set -e
 

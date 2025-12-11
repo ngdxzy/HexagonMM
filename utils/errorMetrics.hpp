@@ -12,6 +12,9 @@ struct ErrorMetrics {
     float l2_relative_error;
     float cosine_similarity;
     float rms_error;
+    float max_relative_error;
+    float ref_val;
+    float computed_val;
 };
 
 

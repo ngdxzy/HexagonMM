@@ -13,11 +13,17 @@ ErrorMetrics calculate_error_metrics(const float* reference, const float* comput
     double norm_ref = 0.0;
     double norm_computed = 0.0;
     double squared_error = 0.0;
+    double max_error = 0.0;
     
     for (int i = 0; i < n_elements; i++) {
         double diff = fabs(computed[i] - reference[i]);
         double ref_abs = fabs(reference[i]);
-        
+        double rel_error = diff / (ref_abs + 1e-6);
+        if (reference[i] != 0.0 && rel_error > metrics.max_relative_error) {
+            metrics.max_relative_error = rel_error;
+            metrics.ref_val = reference[i];
+            metrics.computed_val = computed[i];
+        }
         l1_error += diff;
         l2_error += diff * diff;
         l1_norm_ref += ref_abs;
@@ -52,5 +58,6 @@ void print_error_metrics(const ErrorMetrics& metrics) {
     GGML_LOG_INFO("L2 Relative Error:    %.6f\n", metrics.l2_relative_error);
     GGML_LOG_INFO("Cosine Similarity:    %.8f\n", metrics.cosine_similarity);
     GGML_LOG_INFO("RMS Error:            %.6e\n", metrics.rms_error);
+    GGML_LOG_INFO("Max Relative Error:   %.6e (ref: %.6f, computed: %.6f)\n", metrics.max_relative_error, metrics.ref_val, metrics.computed_val);
     GGML_LOG_INFO("--------------------\n");
 }
